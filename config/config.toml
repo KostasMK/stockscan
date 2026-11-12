@@ -1,0 +1,55 @@
+# stockscan configuration. Everything here is a research tunable: change it, commit it,
+# and the `scoring_version` column in the stored history changes with it.
+# Secrets do NOT go here: they live in `.env` (local) or GitHub Actions secrets.
+
+[scan]
+universe_file = "data/universe/nasdaq100.csv"
+history_calendar_days = 420  # enough for 252 sessions (52-week high/low)
+close_buffer_minutes = 20    # wait this long after 16:00 New York before trusting today's bar
+min_coverage = 0.5           # abort if fewer than 50% of tickers have a bar for the scan date
+top_n = 10                   # rows in the report "top" table and the Telegram alert
+long_only = false            # true = report/alert show only stocks that closed up (storage keeps all)
+
+# --- Ranking -----------------------------------------------------------------
+# score = 100 * sum(weight_i * component_i) / sum(weights), each component in [0, 1].
+# The score is direction-neutral: a big move down on heavy volume ranks as high as a move up.
+[scoring.weights]
+rel_volume = 0.30  # unusual volume
+gap = 0.20         # |overnight gap|
+move = 0.25        # |day change| measured in ATRs
+extreme = 0.15     # closeness to the 52-week high or low
+stretch = 0.10     # |distance from the 20-day SMA|
+
+# The raw value at which each component reaches 1.0 (it is clipped beyond that).
+[scoring.caps]
+rel_volume = 5.0   # 1x average volume -> 0, 5x -> 1
+gap_pct = 5.0      # |gap| of 5% -> 1
+move_atr = 3.0     # a move of 3 ATRs -> 1
+extreme_pct = 10.0 # at the 52-week high/low -> 1, 10% or more away from both -> 0
+stretch_pct = 10.0 # 10% away from the 20-day SMA -> 1
+
+# --- Alpha Vantage news sentiment (top candidates only) ----------------------
+[news]
+enabled = true
+max_calls_per_day = 20      # hard cap enforced in code (free tier allows ~25/day)
+min_interval_seconds = 1.5  # spacing between calls
+lookback_hours = 24         # articles from this window before the session close
+article_limit = 50
+min_relevance = 0.2         # ignore articles that barely mention the ticker
+
+# --- Position sizing (Revolut-style fees; adjust to your plan) ----------------
+[sizing]
+risk_pct = 1.0                   # default risk per trade, % of pot
+max_risk_pct_warning = 2.0       # warn above this
+commission_min_eur = 1.0         # per side: max(commission_min_eur, commission_pct of notional)
+commission_pct = 0.25
+fx_fee_pct_usd_balance = 0.0     # trading from an existing USD balance
+fx_fee_pct_eur_conversion = 1.0  # converting EUR<->USD for the trade (above plan allowance)
+assume_eur_conversion = true     # default when neither --convert-eur nor --usd-balance is given
+fractional_decimals = 4
+
+# --- Intraday archive for the Phase 2 opening-range backtest -----------------
+[intraday]
+interval = "5m"
+top_n = 10                       # top-N of the scan (that day and the previous session)
+always_include = ["NVDA", "QQQ"]
