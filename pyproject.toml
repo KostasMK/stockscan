@@ -45,6 +45,7 @@ ignore = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+filterwarnings = ["error"] # a warning in our own code paths is a bug waiting to happen
 
 [dependency-groups]
 dev = [

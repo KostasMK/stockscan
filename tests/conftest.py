@@ -50,3 +50,54 @@ def make_universe_bars(
 @pytest.fixture
 def raw_bars() -> pd.DataFrame:
     return make_raw_bars()
+
+
+def make_scan(tickers: list[str] | None = None, end: str = "2026-11-11") -> pd.DataFrame:
+    """A realistic scored scan (one row per ticker) built with the real pipeline code."""
+    from datetime import date
+
+    from stockscan.config import ScoringConfig
+    from stockscan.pipeline import build_scan
+
+    tickers = tickers or ["AAA", "BBB", "CCC", "DDD", "EEE", "FFF"]
+    bars = make_universe_bars(tickers, end=end)
+    _, scan, _ = build_scan(bars, tickers, date.fromisoformat(end), ScoringConfig())
+    scan["scoring_version"] = ScoringConfig().version
+    scan["run_at_utc"] = pd.Timestamp(f"{end} 21:30", tz="UTC")
+    return scan
+
+
+def make_intraday_bars(tickers: list[str], sessions: list[str], bars_per_session: int = 6):
+    """5-minute bars from 09:30 New York for each session, in the provider's schema (UTC)."""
+    rows = []
+    for session in sessions:
+        stamps = pd.date_range(
+            f"{session} 09:30", periods=bars_per_session, freq="5min", tz="America/New_York"
+        ).tz_convert("UTC")
+        for offset, ticker in enumerate(tickers):
+            for step, stamp in enumerate(stamps):
+                price = 100.0 + 10 * offset + step
+                rows.append(
+                    {
+                        "ticker": ticker,
+                        "ts": stamp,
+                        "open": price,
+                        "high": price + 1,
+                        "low": price - 1,
+                        "close": price + 0.5,
+                        "volume": 1000.0 + step,
+                    }
+                )
+    return pd.DataFrame(rows)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_secrets(monkeypatch):
+    """Tests must never pick up real keys from the environment or a developer's `.env`.
+
+    An environment variable (even a blank one) takes priority over the `.env` file, and
+    blank means "not configured", so this guarantees no test can call a real API or send
+    a real Telegram message.
+    """
+    for name in ("ALPHAVANTAGE_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
+        monkeypatch.setenv(name, "")
