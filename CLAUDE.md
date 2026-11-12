@@ -175,8 +175,13 @@ All collaborators are injected, so tests run the full pipeline with fakes.
 
 ## Current status
 
-Phase 1 is implemented and tested (277 tests passing, ruff clean), and a live
-scan against Yahoo works end to end without keys.
+Phase 1 is implemented and tested (277 tests passing, ruff clean). Repository:
+<https://github.com/KostasMK/stockscan> (public; `main` = code, `data` = generated history).
+
+Verified on 2026-11-12: a live scan against Yahoo works locally and on GitHub Actions
+(manual run of "Daily scan": scan, intraday archive and commit to the `data` branch all
+succeeded, without keys). The cron schedule itself and the Telegram / Alpha Vantage
+paths have only been exercised by tests with mocks so far.
 
 Open items:
 
