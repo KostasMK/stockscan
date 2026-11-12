@@ -1,0 +1,27 @@
+# Secrets: never commit
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+
+# Local data (history lives on the `data` branch, not on main)
+/data/*.duckdb
+/data/*.duckdb.wal
+/out/
+/data-branch/
+/.cache/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
