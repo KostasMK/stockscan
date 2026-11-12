@@ -1,0 +1,75 @@
+name: Daily scan
+
+on:
+  schedule:
+    # 21:30 UTC, Monday to Friday. The US market closes at 16:00 New York time, which is
+    # 21:00 UTC in winter (EST) and 20:00 UTC in summer (EDT), so this is always after the
+    # close. GitHub may start scheduled jobs late; that is harmless here.
+    - cron: "30 21 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Redo the latest session even if it is already stored"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write # push results to the `data` branch
+
+concurrency:
+  group: daily-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      STOCKSCAN_OUTPUT_DIR: data-branch # reports, scans and intraday bars are written here
+      UV_NO_DEV: "1"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check out the data branch
+        uses: actions/checkout@v7
+        with:
+          ref: data
+          path: data-branch
+
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          enable-cache: true
+
+      - run: uv sync --locked
+
+      # The runner starts with an empty database: rebuild it from the history on the data
+      # branch so the scan can tell whether today's session is already stored.
+      - name: Load history into DuckDB
+        run: uv run scan db import data-branch/scans
+
+      - name: Run the scan
+        env:
+          ALPHAVANTAGE_API_KEY: ${{ secrets.ALPHAVANTAGE_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: uv run scan run ${{ inputs.force && '--force' || '' }}
+
+      # The next two steps also run when the scan step failed (for example a Telegram
+      # error after the results were stored), so data is never lost to a failed alert.
+      - name: Save intraday bars for backtests
+        if: ${{ !cancelled() }}
+        run: uv run scan intraday save
+
+      - name: Commit results to the data branch
+        if: ${{ !cancelled() }}
+        working-directory: data-branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Nothing new to commit."
+          else
+            git commit -m "Scan results $(date -u +%F)"
+            git push
+          fi
