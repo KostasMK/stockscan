@@ -2,10 +2,15 @@ name: Daily scan
 
 on:
   schedule:
-    # 21:30 UTC, Monday to Friday. The US market closes at 16:00 New York time, which is
-    # 21:00 UTC in winter (EST) and 20:00 UTC in summer (EDT), so this is always after the
-    # close. GitHub may start scheduled jobs late; that is harmless here.
+    # Main run: 21:30 UTC, Monday to Friday. The US market closes at 16:00 New York time,
+    # which is 21:00 UTC in winter (EST) and 20:00 UTC in summer (EDT). GitHub often starts
+    # scheduled jobs late (4+ hours has been seen); the scan works out which session to
+    # produce from the market calendar, so a late start is harmless.
     - cron: "30 21 * * 1-5"
+    # Backstop: 03:30 UTC, Tuesday to Saturday (still the previous evening in New York).
+    # A no-op when the main run stored the session; otherwise it catches the session the
+    # main run could not get (for example because Yahoo had not published the bar yet).
+    - cron: "30 3 * * 2-6"
   workflow_dispatch:
     inputs:
       force:
@@ -23,7 +28,8 @@ concurrency:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # The scan may wait up to 15 minutes for a late bar (scan.session_fetch_attempts).
+    timeout-minutes: 35
     env:
       STOCKSCAN_OUTPUT_DIR: data-branch # reports, scans and intraday bars are written here
       UV_NO_DEV: "1"
@@ -54,8 +60,8 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: uv run scan run ${{ inputs.force && '--force' || '' }}
 
-      # The next two steps also run when the scan step failed (for example a Telegram
-      # error after the results were stored), so data is never lost to a failed alert.
+      # The next two steps also run when the scan step failed (missing data, or a Telegram
+      # error after the results were stored), so intraday bars are never lost.
       - name: Save intraday bars for backtests
         if: ${{ !cancelled() }}
         run: uv run scan intraday save
@@ -69,7 +75,18 @@ jobs:
           git add -A
           if git diff --cached --quiet; then
             echo "Nothing new to commit."
-          else
-            git commit -m "Scan results $(date -u +%F)"
-            git push
+            exit 0
           fi
+          # Name the commit after the New York session it contains, not the UTC run date.
+          changed="$(git diff --cached --name-only)"
+          scan="$(printf '%s\n' "$changed" | sed -nE 's#^scans/([0-9-]{10})\.parquet$#\1#p' | sort | tail -n 1)"
+          bars="$(printf '%s\n' "$changed" | sed -nE 's#^intraday/[^/]+/([0-9-]{10})\.parquet$#\1#p' | sort | tail -n 1)"
+          if [ -n "$scan" ]; then
+            message="Scan results $scan (session)"
+          elif [ -n "$bars" ]; then
+            message="Intraday bars $bars (session), no new scan"
+          else
+            message="Update data files"
+          fi
+          git commit -m "$message"
+          git push
