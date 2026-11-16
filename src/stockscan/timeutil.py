@@ -18,7 +18,7 @@ def now_utc() -> datetime:
     return datetime.now(UTC)
 
 
-def _require_aware(moment: datetime) -> None:
+def require_aware(moment: datetime) -> None:
     if moment.tzinfo is None:
         raise ValueError("naive datetime: every timestamp in stockscan must be timezone-aware")
 
@@ -32,7 +32,7 @@ def last_completed_session_cutoff(now: datetime, buffer_minutes: int = 20) -> da
     The result is a calendar date, not necessarily a trading day: on a Sunday it returns
     Sunday (or Saturday before 16:00+buffer), and the latest bar on or before it is Friday's.
     """
-    _require_aware(now)
+    require_aware(now)
     ny_now = now.astimezone(NY)
     trusted_from = datetime.combine(ny_now.date(), REGULAR_CLOSE, tzinfo=NY) + timedelta(
         minutes=buffer_minutes
@@ -46,7 +46,7 @@ def session_close_utc(session: date) -> datetime:
 
 
 def to_athens(moment: datetime) -> datetime:
-    _require_aware(moment)
+    require_aware(moment)
     return moment.astimezone(ATHENS)
 
 
