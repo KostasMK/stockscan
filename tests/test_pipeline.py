@@ -9,7 +9,13 @@ import pytest
 
 from stockscan.config import AppConfig, NewsConfig, ScanConfig, ScoringConfig
 from stockscan.http import HttpError
-from stockscan.pipeline import DataQualityError, attach_news, build_scan, run_scan
+from stockscan.pipeline import (
+    DataQualityError,
+    attach_news,
+    build_scan,
+    check_session,
+    run_scan,
+)
 from stockscan.providers.base import NewsSentiment, NewsUnavailableError
 from stockscan.storage import ScanStore
 from tests.conftest import make_raw_bars, make_universe_bars
@@ -79,6 +85,7 @@ def run(store, tmp_path, bars, **overrides):
         "store": store,
         "output_dir": tmp_path,
         "now": AFTER_CLOSE,
+        "sleep": lambda seconds: None,
     }
     arguments.update(overrides)
     return run_scan(**arguments)
@@ -221,7 +228,7 @@ class TestRunScan:
 
     def test_stale_price_source_is_rejected(self, store, tmp_path, bars):
         two_weeks_later = datetime(2026, 11, 25, 21, 30, tzinfo=UTC)
-        with pytest.raises(DataQualityError, match="stale"):
+        with pytest.raises(DataQualityError, match="No complete daily bars for session 2026-11-25"):
             run(store, tmp_path, bars, now=two_weeks_later)
 
     def test_missing_tickers_are_listed_in_the_report(self, store, tmp_path, bars):
@@ -265,6 +272,167 @@ class TestRunScan:
         assert outcome.scan["news_headline"].isna().all()
 
 
+class SequencePrices(FakePrices):
+    """Returns a different answer on each call (the last one repeats)."""
+
+    def __init__(self, *answers: pd.DataFrame) -> None:
+        super().__init__(answers[0])
+        self.answers = list(answers)
+
+    def daily_bars(self, tickers, start, end):
+        self.requests.append((list(tickers), start, end))
+        return self.answers[min(len(self.requests), len(self.answers)) - 1]
+
+
+def without_session(bars: pd.DataFrame, day: str) -> pd.DataFrame:
+    return bars[bars["date"] != pd.Timestamp(day)].reset_index(drop=True)
+
+
+def with_volume_on(bars: pd.DataFrame, day: str, volume: float) -> pd.DataFrame:
+    out = bars.copy()
+    out.loc[out["date"] == pd.Timestamp(day), "volume"] = volume
+    return out
+
+
+class TestMissingSessionRegression:
+    """Regressions for the scheduled runs of 12 and 13 Nov 2026.
+
+    GitHub started them at 01:59 and 01:32 UTC (Thursday and Friday evening in New York),
+    Yahoo's answer had no usable bar for that evening's session, and the old code quietly
+    took the latest bar it had: the first run skipped (11 Nov already stored), the second
+    scanned 12 Nov instead of 13 Nov.
+    """
+
+    THURSDAY_RUN = datetime(2026, 11, 13, 1, 59, tzinfo=UTC)
+    FRIDAY_RUN = datetime(2026, 11, 14, 1, 32, tzinfo=UTC)
+
+    def test_thursday_run_fails_instead_of_reporting_wednesday_as_already_stored(
+        self, store, tmp_path, bars
+    ):
+        run(store, tmp_path, bars)  # Wednesday 11 Nov is stored, as it was on the data branch
+        sleeps: list[float] = []
+        prices = FakePrices(bars)  # Yahoo: nothing for Thursday 12 Nov yet
+        notifier = FakeNotifier()
+        with pytest.raises(DataQualityError) as error:
+            run(
+                store,
+                tmp_path,
+                bars,
+                prices=prices,
+                notifier=notifier,
+                now=self.THURSDAY_RUN,
+                sleep=sleeps.append,
+            )
+        message = str(error.value)
+        assert "No complete daily bars for session 2026-11-12 after 3 attempt(s)" in message
+        assert "0/6 tickers have a usable bar (no row: 6" in message
+        assert "newest bar returned: 2026-11-11" in message
+        assert sleeps == [300, 600]  # 5 then 10 minutes between the three attempts
+        assert [request[2] for request in prices.requests] == [date(2026, 11, 12)] * 3
+        assert notifier.messages == []
+        assert store.scan_dates() == [DAY]
+
+    def test_friday_run_fails_instead_of_scanning_thursday(self, store, tmp_path):
+        through_thursday = make_universe_bars(TICKERS, end="2026-11-12")
+        with pytest.raises(DataQualityError, match="session 2026-11-13"):
+            run(store, tmp_path, through_thursday, now=self.FRIDAY_RUN)
+        assert store.scan_dates() == []  # Thursday was not scanned in Friday's place
+        assert not (tmp_path / "reports" / "2026-11-12.md").exists()
+
+    @pytest.mark.parametrize("volume", [0.0, float("nan")])
+    def test_newest_bar_with_no_volume_fails_too(self, store, tmp_path, volume):
+        thursday = with_volume_on(
+            make_universe_bars(TICKERS, end="2026-11-12"), "2026-11-12", volume
+        )
+        with pytest.raises(DataQualityError, match="zero or missing volume: 6,"):
+            run(store, tmp_path, thursday, now=self.THURSDAY_RUN)
+        assert store.scan_dates() == []
+
+    def test_bar_that_appears_on_retry_is_scanned(self, store, tmp_path):
+        complete = make_universe_bars(TICKERS, end="2026-11-12")
+        prices = SequencePrices(without_session(complete, "2026-11-12"), complete)
+        sleeps: list[float] = []
+        outcome = run(
+            store, tmp_path, complete, prices=prices, now=self.THURSDAY_RUN, sleep=sleeps.append
+        )
+        assert outcome.status == "completed"
+        assert outcome.scan_date == date(2026, 11, 12)
+        assert sleeps == [300]
+        assert outcome.data_check.startswith("Session 2026-11-12: 6/6 tickers have a usable bar")
+
+    def test_backstop_run_is_a_no_op_without_fetching(self, store, tmp_path):
+        thursday = make_universe_bars(TICKERS, end="2026-11-12")
+        run(store, tmp_path, thursday, now=self.THURSDAY_RUN)
+        prices = FakePrices(thursday)
+        backstop = datetime(2026, 11, 13, 3, 30, tzinfo=UTC)
+        outcome = run(store, tmp_path, thursday, prices=prices, now=backstop)
+        assert outcome.status == "skipped"
+        assert outcome.scan_date == date(2026, 11, 12)
+        assert prices.requests == []  # no Yahoo call when the session is already stored
+
+    def test_backstop_run_catches_the_session_the_first_run_missed(self, store, tmp_path, bars):
+        thursday = make_universe_bars(TICKERS, end="2026-11-12")
+        with pytest.raises(DataQualityError):
+            run(store, tmp_path, bars, now=self.THURSDAY_RUN)
+        backstop = datetime(2026, 11, 13, 3, 30, tzinfo=UTC)
+        outcome = run(store, tmp_path, thursday, now=backstop)
+        assert outcome.status == "completed"
+        assert outcome.scan_date == date(2026, 11, 12)
+
+    def test_historical_rerun_does_not_wait_for_missing_data(self, store, tmp_path, bars):
+        sleeps: list[float] = []
+        gap = without_session(bars, "2026-11-10")
+        with pytest.raises(DataQualityError, match="after 1 attempt"):
+            run(store, tmp_path, gap, as_of=date(2026, 11, 10), sleep=sleeps.append)
+        assert sleeps == []
+
+
+class TestMarketCalendarInTheScan:
+    def test_holiday_evening_scans_the_session_before(self, store, tmp_path):
+        wednesday = make_universe_bars(TICKERS, end="2026-11-25")
+        thanksgiving_evening = datetime(2026, 11, 26, 22, 0, tzinfo=UTC)
+        outcome = run(store, tmp_path, wednesday, now=thanksgiving_evening)
+        assert outcome.scan_date == date(2026, 11, 25)
+
+    def test_half_day_is_scanned_after_13_00_and_news_stops_at_that_close(self, store, tmp_path):
+        black_friday = make_universe_bars(TICKERS, end="2026-11-27")
+        news = FakeNews()
+        outcome = run(
+            store,
+            tmp_path,
+            black_friday,
+            news=news,
+            now=datetime(2026, 11, 27, 18, 30, tzinfo=UTC),  # 13:30 New York
+        )
+        assert outcome.scan_date == date(2026, 11, 27)
+        assert news.calls[0][2] == datetime(2026, 11, 27, 18, 0, tzinfo=UTC)
+
+    @pytest.mark.parametrize("day", [date(2026, 11, 26), date(2026, 11, 8)])
+    def test_as_of_must_be_a_trading_session(self, store, tmp_path, bars, day):
+        with pytest.raises(ValueError, match="not a trading session"):
+            run(store, tmp_path, bars, as_of=day)
+
+
+class TestCheckSession:
+    def test_counts_each_kind_of_problem(self, bars):
+        day = "2026-11-11"
+        frame = bars.copy()
+        on_day = frame["date"] == pd.Timestamp(day)
+        frame.loc[on_day & (frame["ticker"] == "AAA"), "volume"] = 0.0
+        frame.loc[on_day & (frame["ticker"] == "BBB"), "close"] = float("nan")
+        frame = frame[~(on_day & (frame["ticker"] == "CCC"))]
+        check = check_session(frame, [*TICKERS, "GONE"], DAY)
+        assert (check.tickers, check.usable) == (7, 3)
+        assert (check.no_row, check.no_volume, check.bad_prices) == (2, 1, 1)
+        assert check.newest_bar == DAY
+        assert check.coverage == pytest.approx(3 / 7)
+
+    def test_empty_answer(self, bars):
+        check = check_session(bars.iloc[0:0], TICKERS, DAY)
+        assert (check.usable, check.no_row, check.newest_bar) == (0, 6, None)
+        assert "newest bar returned: none" in check.describe()
+
+
 class TestNews:
     def test_news_is_fetched_for_the_top_candidates_only(self, store, tmp_path, bars):
         news = FakeNews()
@@ -303,7 +471,7 @@ class TestNews:
 
     def test_attach_news_without_a_provider_adds_empty_columns(self, bars):
         _, scan, _ = build_scan(bars, TICKERS, DAY, ScoringConfig())
-        with_columns, note = attach_news(scan, ["AAA"], None, DAY, 24)
+        with_columns, note = attach_news(scan, ["AAA"], None, AFTER_CLOSE, 24)
         assert note is None
         assert with_columns["news_score"].isna().all()
         assert "news_url" in with_columns.columns

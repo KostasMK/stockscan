@@ -5,7 +5,9 @@
 [scan]
 universe_file = "data/universe/nasdaq100.csv"
 history_calendar_days = 420  # enough for 252 sessions (52-week high/low)
-close_buffer_minutes = 20    # wait this long after 16:00 New York before trusting today's bar
+close_buffer_minutes = 20    # minutes after the close (13:00 on half-days) before trusting the bar
+session_fetch_attempts = 3   # Yahoo can publish the newest bar late: try this often, then fail
+session_retry_minutes = 5.0  # first retry after 5 min, then 10; never falls back to an older day
 min_coverage = 0.5           # abort if fewer than 50% of tickers have a bar for the scan date
 top_n = 10                   # rows in the report "top" table and the Telegram alert
 long_only = false            # true = report/alert show only stocks that closed up (storage keeps all)

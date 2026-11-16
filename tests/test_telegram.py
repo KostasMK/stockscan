@@ -7,7 +7,13 @@ import respx
 
 from stockscan.http import HttpError
 from stockscan.report import fmt_pct, fmt_price, fmt_ratio, select_top
-from stockscan.telegram import API_BASE, TelegramNotifier, build_alert, split_message
+from stockscan.telegram import (
+    API_BASE,
+    TelegramNotifier,
+    build_alert,
+    build_failure_alert,
+    split_message,
+)
 from tests.conftest import make_scan
 
 DAY = date(2026, 11, 11)
@@ -94,6 +100,14 @@ class TestSplitMessage:
     def test_single_oversized_block_is_hard_split(self):
         parts = split_message("y" * 250, limit=100)
         assert [len(part) for part in parts] == [100, 100, 50]
+
+
+def test_failure_alert_is_short_escaped_and_in_athens_time():
+    text = build_failure_alert("No complete daily bars for <session> 2026-11-12", sent_at=SENT)
+    assert text.startswith("<b>Scan failed</b>\n")
+    assert "&lt;session&gt;" in text  # Telegram HTML mode must not see raw angle brackets
+    assert "Sent 2026-11-11 23:31 Athens" in text
+    assert "next scheduled run tries again" in text
 
 
 class TestTelegramNotifier:

@@ -69,7 +69,11 @@ class ScanConfig(_Strict):
     history_calendar_days: int = Field(420, ge=30)
     """Calendar days of daily history to fetch (252 sessions are needed for 52-week ranges)."""
     close_buffer_minutes: int = Field(20, ge=0)
-    """Minutes after 16:00 New York before today's bar is trusted as final."""
+    """Minutes after the session close (from the market calendar) before its bar is trusted."""
+    session_fetch_attempts: int = Field(3, ge=1)
+    """Tries to get complete bars for the expected session before failing the run."""
+    session_retry_minutes: float = Field(5.0, ge=0)
+    """Wait before the first retry; doubles on each further retry (5, then 10 minutes)."""
     min_coverage: float = Field(0.5, gt=0, le=1)
     """Abort if fewer than this share of the universe has a bar for the scan date."""
     top_n: int = Field(10, ge=1)

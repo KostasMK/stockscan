@@ -35,7 +35,7 @@ from stockscan.report import (
 )
 from stockscan.sizing import FeeModel, PositionSize, size_position
 from stockscan.storage import ScanStore
-from stockscan.telegram import Notifier, TelegramNotifier, build_alert
+from stockscan.telegram import Notifier, TelegramNotifier, build_alert, build_failure_alert
 from stockscan.timeutil import format_athens, now_utc
 from stockscan.universe import UniverseError, load_universe, refresh_universe
 
@@ -147,6 +147,16 @@ def _print_top(outcome: ScanOutcome, top_n: int, long_only: bool) -> None:
     typer.echo("")
 
 
+def _notify_failure(notifier: Notifier | None, error: str) -> None:
+    """Best effort: tell the owner a scheduled scan failed. Never masks the real error."""
+    if notifier is None:
+        return
+    try:
+        notifier.send(build_failure_alert(error, sent_at=now_utc()))
+    except HttpError as send_error:
+        _warn(f"Could not send the failure alert either: {send_error}")
+
+
 @app.command()
 def run(
     as_of: str | None = typer.Option(
@@ -197,12 +207,17 @@ def run(
                 force=force,
                 long_only=long_only,
             )
-        except (ProviderError, DataQualityError, ValueError) as error:
+        except (ProviderError, DataQualityError) as error:
+            _notify_failure(notifier, str(error))
+            _fail(str(error))
+        except ValueError as error:
             _fail(str(error))
 
     typer.echo(outcome.message)
     if outcome.status == "skipped":
         return
+    if outcome.data_check:
+        typer.echo(outcome.data_check)
     _print_top(outcome, config.scan.top_n, show_long_only)
     for note in outcome.notes:
         _warn(note)

@@ -44,7 +44,10 @@ def workspace(tmp_path, monkeypatch) -> Path:
     universe = tmp_path / "universe.csv"
     universe.write_text("ticker,name,sector\n" + "".join(f"{t},{t} Inc,Tech\n" for t in TICKERS))
     config = tmp_path / "config.toml"
-    config.write_text(f'[scan]\nuniverse_file = "{universe.as_posix()}"\ntop_n = 3\n')
+    config.write_text(
+        f'[scan]\nuniverse_file = "{universe.as_posix()}"\ntop_n = 3\n'
+        "session_retry_minutes = 0\n"  # retrying a missing session must not sleep in tests
+    )
     monkeypatch.setenv("STOCKSCAN_CONFIG_FILE", str(config))
     monkeypatch.setenv("STOCKSCAN_OUTPUT_DIR", str(tmp_path / "out"))
     monkeypatch.setenv("STOCKSCAN_DB_PATH", str(tmp_path / "db" / "scan.duckdb"))
@@ -145,6 +148,44 @@ class TestRun:
         result = invoke("run", "--date", "2026-11-12")
         assert result.exit_code == 1
         assert "not a finished session" in result.output
+
+    def test_market_holiday_is_a_clean_error(self, workspace):
+        result = invoke("run", "--date", "2026-11-11")  # fine: a Wednesday
+        assert result.exit_code == 0, result.output
+        result = invoke("run", "--date", "2025-12-25")
+        assert result.exit_code == 1
+        assert "not a trading session" in result.output
+
+    def test_prints_how_complete_the_data_was(self, workspace):
+        result = invoke("run")
+        assert "Session 2026-11-11: 6/6 tickers have a usable bar" in result.output
+
+    @respx.mock
+    def test_missing_session_fails_loudly_and_alerts(self, workspace, monkeypatch):
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", TOKEN)
+        monkeypatch.setenv("TELEGRAM_CHAT_ID", "42")
+        route = respx.post(f"{API_BASE}/bot{TOKEN}/sendMessage").respond(json={"ok": True})
+        # Thursday evening in New York; the fake provider only has bars up to Wednesday.
+        monkeypatch.setattr(cli, "now_utc", lambda: datetime(2026, 11, 13, 1, 59, tzinfo=UTC))
+        result = invoke("run")
+        assert result.exit_code == 1
+        assert "No complete daily bars for session 2026-11-12" in result.output
+        assert route.call_count == 1
+        assert "Scan failed" in route.calls.last.request.content.decode()
+        with ScanStore(workspace / "db" / "scan.duckdb") as store:
+            assert store.scan_dates() == []
+
+    @respx.mock
+    def test_failed_failure_alert_does_not_hide_the_error(self, workspace, monkeypatch):
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", TOKEN)
+        monkeypatch.setenv("TELEGRAM_CHAT_ID", "42")
+        respx.post(f"{API_BASE}/bot{TOKEN}/sendMessage").respond(status_code=400, json={})
+        monkeypatch.setattr(cli, "now_utc", lambda: datetime(2026, 11, 13, 1, 59, tzinfo=UTC))
+        result = invoke("run")
+        assert result.exit_code == 1
+        assert "Could not send the failure alert" in result.output
+        assert "No complete daily bars for session 2026-11-12" in result.output
+        assert TOKEN not in result.output
 
     def test_missing_universe_file_is_a_clean_error(self, workspace):
         (workspace / "universe.csv").unlink()

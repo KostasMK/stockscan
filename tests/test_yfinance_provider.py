@@ -189,6 +189,23 @@ class TestCachedPriceProvider:
         cached.daily_bars(["TEST"], date(2026, 1, 1), date(2026, 11, 11))
         assert inner.calls == 2
 
+    def test_daily_answer_without_the_requested_session_is_not_cached(self, tmp_path, raw_bars):
+        # Yahoo had not published 12 Nov yet: a retry must ask again, not read the cache.
+        inner = CountingProvider(raw_bars)  # ends 11 Nov
+        cached = CachedPriceProvider(inner, tmp_path)
+        cached.daily_bars(["TEST"], date(2026, 1, 1), date(2026, 11, 12))
+        cached.daily_bars(["TEST"], date(2026, 1, 1), date(2026, 11, 12))
+        assert inner.calls == 2
+
+    def test_zero_volume_on_the_requested_session_is_not_cached(self, tmp_path, raw_bars):
+        incomplete = raw_bars.copy()
+        incomplete.loc[incomplete.index[-1], "volume"] = 0.0
+        inner = CountingProvider(incomplete)
+        cached = CachedPriceProvider(inner, tmp_path)
+        cached.daily_bars(["TEST"], date(2026, 1, 1), date(2026, 11, 11))
+        cached.daily_bars(["TEST"], date(2026, 1, 1), date(2026, 11, 11))
+        assert inner.calls == 2
+
     def test_empty_results_are_not_cached(self, tmp_path, raw_bars):
         inner = CountingProvider(raw_bars.iloc[0:0])
         cached = CachedPriceProvider(inner, tmp_path)

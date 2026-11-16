@@ -69,6 +69,17 @@ def build_alert(
     return "\n\n".join(blocks)
 
 
+def build_failure_alert(error: str, *, sent_at: datetime) -> str:
+    """Short HTML message for a scan that could not run (data missing, provider down)."""
+    sent_athens = to_athens(sent_at).strftime("%Y-%m-%d %H:%M")
+    return (
+        "<b>Scan failed</b>\n"
+        f"{html.escape(error)}\n\n"
+        f"Sent {sent_athens} Athens. Nothing was stored for that session; "
+        "the next scheduled run tries again."
+    )
+
+
 def split_message(text: str, limit: int = MESSAGE_LIMIT) -> list[str]:
     """Split on blank lines so that every part fits Telegram's message size limit."""
     parts: list[str] = []

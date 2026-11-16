@@ -183,11 +183,24 @@ class YFinanceProvider:
         return pd.concat(parts, ignore_index=True)
 
 
+def has_usable_bar_on(bars: pd.DataFrame, day: date) -> bool:
+    """True if ``bars`` is non-empty and every ticker in it has a traded bar dated ``day``."""
+    if bars.empty:
+        return False
+    on_day = bars[(pd.to_datetime(bars["date"]).dt.normalize() == pd.Timestamp(day))]
+    traded = on_day[on_day["volume"].fillna(0) > 0]
+    return set(traded["ticker"]) == set(bars["ticker"])
+
+
 class CachedPriceProvider:
     """Parquet disk cache around any ``PriceProvider``.
 
     Repeated runs within ``max_age`` (re-running a scan, iterating on a report) reuse the
     first download instead of hitting the source again.
+
+    Daily bars are only cached (and only reused) when every ticker has a usable bar on the
+    requested ``end`` date. An incomplete answer, such as Yahoo not having published the
+    newest session yet, must be fetched again on retry instead of being served from disk.
     """
 
     def __init__(
@@ -202,23 +215,34 @@ class CachedPriceProvider:
         digest = hashlib.sha256(key.encode()).hexdigest()[:16]
         return self._cache_dir / f"{kind}_{digest}.parquet"
 
-    def _cached(self, path: Path, fetch: Callable[[], pd.DataFrame]) -> pd.DataFrame:
+    def _cached(
+        self,
+        path: Path,
+        fetch: Callable[[], pd.DataFrame],
+        complete: Callable[[pd.DataFrame], bool] = lambda frame: not frame.empty,
+    ) -> pd.DataFrame:
         try:
             age = timedelta(seconds=time.time() - path.stat().st_mtime)
             if age <= self._max_age:
-                logger.info("using cached prices from %s", path.name)
-                return pd.read_parquet(path)
+                cached = pd.read_parquet(path)
+                if complete(cached):
+                    logger.info("using cached prices from %s", path.name)
+                    return cached
         except (OSError, ValueError):
             pass  # no cache file, or an unreadable one: fetch again
         frame = fetch()
-        if not frame.empty:
+        if complete(frame):
             self._cache_dir.mkdir(parents=True, exist_ok=True)
             frame.to_parquet(path, index=False)
         return frame
 
     def daily_bars(self, tickers: Sequence[str], start: date, end: date) -> pd.DataFrame:
         path = self._path("daily", tickers, start, end)
-        return self._cached(path, lambda: self._inner.daily_bars(tickers, start, end))
+        return self._cached(
+            path,
+            lambda: self._inner.daily_bars(tickers, start, end),
+            lambda frame: has_usable_bar_on(frame, end),
+        )
 
     def intraday_bars(
         self, tickers: Sequence[str], start: date, end: date, interval: str
