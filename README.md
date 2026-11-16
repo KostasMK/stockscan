@@ -165,7 +165,12 @@ It is a calculator. It does not create or send orders.
 ## Automation with GitHub Actions
 
 `.github/workflows/daily-scan.yml` runs at 21:30 UTC on weekdays (after the US close in
-both winter and summer time). Each run:
+both winter and summer time), plus a backstop run at 03:30 UTC Tuesday to Saturday that
+does nothing if the session is already stored. GitHub often starts scheduled jobs late;
+the scan works out the session from the NYSE calendar, so that does not matter. If
+Yahoo has not published the session's bars, the scan retries for up to 15 minutes, then
+fails with a clear message (and a "Scan failed" Telegram note) instead of quietly
+scanning an older day; the backstop run picks the session up later. Each run:
 
 1. rebuilds a DuckDB database from the history on the `data` branch,
 2. runs the scan and sends the alert,
@@ -209,8 +214,8 @@ con.sql("""
 A signal for day T may only use data available at the close of day T. This is enforced
 in three places:
 
-- `timeutil.last_completed_session_cutoff` decides which session is finished; every bar
-  after it is dropped before any calculation.
+- `market_calendar.last_completed_session` decides which session is finished (NYSE
+  calendar, including half-days); every bar after it is dropped before any calculation.
 - Every metric uses only backward-looking operations (`shift` with a positive lag,
   trailing windows).
 - `tests/test_no_lookahead.py` recomputes all metrics after corrupting or deleting every

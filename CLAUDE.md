@@ -36,7 +36,7 @@ stored history, and a position-sizing calculator. Phases 2 to 4 are in `ROADMAP.
 
 ```bash
 uv sync                      # install
-uv run pytest                # 277 tests, no network, ~20 s
+uv run pytest                # 311 tests, no network, ~60 s
 uv run ruff check . && uv run ruff format --check .
 uv run scan run              # live scan (works without keys: news/Telegram are skipped)
 uv run scan --help
@@ -52,7 +52,9 @@ runs ruff and pytest on every push to `main`.
 src/stockscan/
   cli.py          typer app: run | report | size | universe refresh | db import | intraday save
   config.py       EnvSettings (.env: secrets, paths) + AppConfig (config/config.toml: tunables)
-  timeutil.py     NY/UTC/Athens; last_completed_session_cutoff = the look-ahead boundary
+  timeutil.py     NY/UTC/Athens helpers; last_completed_session_cutoff (calendar-free, intraday)
+  market_calendar.py  MarketCalendar protocol, ExchangeCalendar (NYSE via exchange_calendars),
+                  last_completed_session = the session a run must produce (and the look-ahead boundary)
   universe.py     load CSV; refresh from Wikipedia with validation and diff
   http.py         RateLimiter, request_with_retry (redacts secrets), JsonDiskCache, DailyBudget
   providers/
@@ -76,13 +78,16 @@ tests/                        one file per module; conftest.py builds synthetic 
 Data flow of `scan run` (`pipeline.run_scan`):
 
 ```
-universe CSV -> PriceProvider.daily_bars (420 calendar days)
-  -> clean_daily_bars(cutoff)      drop bars after the last finished session, halts, bad rows
+market calendar -> session = last NYSE session whose close + 20 min has passed
+  -> skip if that session is already stored (unless --force); no fetch at all
+universe CSV -> fetch_session_bars: PriceProvider.daily_bars (420 calendar days)
+     check_session: enough tickers with a usable bar for `session`?
+     no -> retry after 5, then 10 min -> still no: DataQualityError (+ Telegram failure note)
+  -> clean_daily_bars(session)     drop bars after the session, halts, bad rows
   -> adjust_ohlc                   dividend-adjust OHLC, keep raw_close for display
   -> compute_universe_metrics      all sessions, per ticker
-  -> rows of the scan date -> score_universe -> rank
-  -> skip if that date is already stored (unless --force)
-  -> attach_news for the shown top-N only
+  -> rows of `session` -> score_universe -> rank
+  -> attach_news for the shown top-N only (window ends at the calendar close)
   -> ScanStore.save_scan -> export parquet -> write_reports -> Telegram alert
 ```
 
@@ -117,14 +122,21 @@ All collaborators are injected, so tests run the full pipeline with fakes.
 - **Score** is direction-neutral; `direction` is up/down/flat from the day change.
   `--long-only` (or `scan.long_only`) filters the report, the alert and the news lookups
   only. Storage always keeps everything.
-- **Scan date** is the latest bar on or before the cutoff, so there is no holiday
-  calendar. A stored date is skipped, which makes weekend/holiday runs no-ops.
-  `scan run --date` re-runs history and never sends Telegram.
-- **News window** is the 24 hours ending at 16:00 New York of the scan date. Articles
-  after the close are ignored even if the API returns them.
-- **Failure policy:** missing tickers are reported and skipped; coverage below 50% or a
-  latest bar older than 5 days aborts the run (`DataQualityError`); news problems add a
-  note; a Telegram failure exits non-zero *after* results are stored.
+- **Scan date** comes from the NYSE calendar (`market_calendar.last_completed_session`),
+  never from "the newest bar the source returned". A scan is always for exactly that
+  session; if its bar is missing the run fails, it never falls back to an older day.
+  A stored session is skipped before fetching, which makes weekend/holiday runs and the
+  backstop cron no-ops. `scan run --date` must be a trading session, re-runs history
+  without retries, and never sends Telegram.
+- **News window** is the 24 hours ending at the session close from the calendar
+  (16:00 New York, 13:00 on half-days). Articles after the close are ignored even if the
+  API returns them.
+- **Failure policy:** missing tickers are reported and skipped. Fewer than `min_coverage`
+  (50%) of tickers with a usable bar for the session: refetch after 5 and 10 minutes
+  (`scan.session_fetch_attempts`, `scan.session_retry_minutes`), then abort with
+  `DataQualityError` (message counts no row / no volume / bad prices) and a Telegram
+  "Scan failed" note. News problems add a note; a Telegram alert failure exits non-zero
+  *after* results are stored. Every completed run prints the `SessionCheck` line.
 - **Sizing:** long only (stop must be below entry). Fees: commission
   `max(min_eur, pct)` per side plus FX fee both ways. Defaults model Revolut and assume
   EUR conversion (1% FX); the owner will adjust `[sizing]` once they know their plan's fees.
@@ -138,8 +150,17 @@ All collaborators are injected, so tests run the full pipeline with fakes.
 
 - **yfinance returns today's half-formed bar** during the US session. The cutoff in
   `clean_daily_bars` is what protects against it; do not remove it. Its `end` argument is
-  exclusive; columns are a `(ticker, field)` MultiIndex; failed tickers come back as
-  all-NaN columns, not errors.
+  exclusive (midnight New York of that date, which is correct); columns are a
+  `(ticker, field)` MultiIndex; failed tickers come back as all-NaN columns, not errors.
+- **Yahoo can serve the newest session late.** On 12 and 13 Nov 2026 the GitHub runs
+  (started 01:59 and 01:32 UTC) got no usable bar for that evening's session for any
+  ticker, while the same request a few days later returned complete bars. The old code
+  silently scanned an older session. Whether Yahoo omitted the row or sent zero volume
+  was not visible then; the `SessionCheck` line now logs it. Never reintroduce a
+  "latest bar" fallback.
+- **exchange_calendars 4.x** triggers a pandas 3 `Pandas4Warning` when a calendar is
+  built; `ExchangeCalendar` silences exactly that one (tests run with warnings as errors).
+  It covers about 20 years back to 1 year ahead of today.
 - **Yahoo may throttle or block** datacenter IPs (GitHub runners) without warning. The
   provider retries with backoff and the run fails loudly if nothing comes back. If this
   becomes frequent, implement another `PriceProvider`; nothing else needs to change.
@@ -160,28 +181,38 @@ All collaborators are injected, so tests run the full pipeline with fakes.
 - **Wikipedia moved the constituents table** to `List_of_NASDAQ-100_companies`; the
   refresh tries both pages and validates size and symbols before overwriting the CSV.
 - **`astral-sh/setup-uv` has no moving major tag**: pin an exact version (`@v10.3.3`).
-- **GitHub cron** can start late or occasionally skip a run, and GitHub disables
-  scheduled workflows in repositories with no activity for 60 days. The intraday job
-  looks back 5 days to heal short gaps.
+- **GitHub cron** starts late (4 to 4.5 hours observed) or occasionally skips a run, and
+  GitHub disables scheduled workflows in repositories with no activity for 60 days. The
+  workflow has a main cron (21:30 UTC Mon-Fri) and a backstop (03:30 UTC Tue-Sat); both
+  resolve the session from the calendar, so lateness is harmless. The intraday job
+  looks back 5 days to heal short gaps. Data-branch commits are named after the New York
+  session (`Scan results YYYY-MM-DD (session)`), not the UTC run date.
 - **Historical re-runs are not point-in-time for adjustments:** `scan run --date X` uses
   Yahoo's current dividend adjustments, so values can differ slightly from the row stored
   on day X. The stored row is the record; do not overwrite history casually (`--force`).
 - **Survivorship:** the universe CSV is today's index. For backtests use the tickers
   present in `daily_scan` on each date.
-- **Half-days:** the news window assumes a 16:00 close; on the few 13:00 closes it
-  includes three extra hours. Harmless for alerts, worth knowing for analysis.
+- **Half-days:** the scan and its news window use the calendar's 13:00 close. Two places
+  still assume 16:00: the "US close" time printed in reports/alerts, and the calendar-free
+  cutoff the intraday archive uses (it just waits longer on half-days, which is safe).
 - **Windows:** consoles default to a legacy code page; `cli.main` reconfigures stdout to
   UTF-8. `.gitattributes` forces LF so `ruff format --check` agrees between Windows and CI.
 
 ## Current status
 
-Phase 1 is implemented and tested (277 tests passing, ruff clean). Repository:
+Phase 1 is implemented and tested (311 tests passing, ruff clean). Repository:
 <https://github.com/KostasMK/stockscan> (public; `main` = code, `data` = generated history).
 
 Verified on 2026-11-12: a live scan against Yahoo works locally and on GitHub Actions
 (manual run of "Daily scan": scan, intraday archive and commit to the `data` branch all
-succeeded, without keys). The cron schedule itself and the Telegram / Alpha Vantage
-paths have only been exercised by tests with mocks so far.
+succeeded, without keys). The Telegram / Alpha Vantage paths have only been exercised
+by tests with mocks so far.
+
+2026-11-16, work plan Part 1 of 3 (scan lag): fixed (calendar session, retry then fail,
+backstop cron, session-named data commits). Nov 13 backfilled with `scan run --date`.
+The work plan's Part 2 (USD-balance sizing default, Finnhub news and earnings calendar,
+first live run checklist) and Part 3 (Alpaca paper-trading bot with replay) follow; see
+`ROADMAP.md`.
 
 Open items:
 
@@ -191,6 +222,7 @@ Open items:
       same three values as GitHub Actions secrets (`gh secret set ...`, see README).
 - [ ] Owner to confirm Revolut fees and adjust `[sizing]` in `config/config.toml`.
 - [ ] Watch the first week of scheduled runs (Actions tab, `data` branch) for Yahoo
-      throttling on GitHub runners.
+      throttling on GitHub runners, and read the `SessionCheck` line of the first late
+      run to learn whether Yahoo omits the newest row or sends it with zero volume.
 
 Next: Phase 1.5 acceptance checks, then Phase 2 (see `ROADMAP.md`).

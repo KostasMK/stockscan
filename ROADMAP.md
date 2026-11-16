@@ -21,11 +21,18 @@ The Phase 2 backtest needs months of intraday history, and Yahoo only serves abo
 last 60 days of 5-minute bars. The daily GitHub Action already archives them
 (`scan intraday save`, see `src/stockscan/intraday.py`).
 
+Done on 2026-11-16 (scan-lag fix): the scan's session comes from the NYSE calendar; a
+missing bar is retried and then fails loudly instead of scanning an older day; a
+backstop cron at 03:30 UTC catches sessions the main run missed; data-branch commits
+are named after the session. The 13 Nov gap was backfilled.
+
 Acceptance criteria:
 
 - [ ] The `data` branch gains one `intraday/5m/YYYY-MM-DD.parquet` and one
-      `scans/YYYY-MM-DD.parquet` per trading day with no gaps over 4 consecutive weeks.
-      (A missed day inside the 5-day look-back heals itself; a longer outage is a gap.)
+      `scans/YYYY-MM-DD.parquet` per trading day with no gaps over 4 consecutive weeks,
+      counted from 2026-11-16. (A missed day inside the 5-day look-back heals itself for
+      intraday bars; a missed scan is caught by the backstop run, or by hand with
+      `scan run --date`.)
 - [ ] One live end-to-end run with real Telegram and Alpha Vantage keys has been checked
       by eye (see "Current status" in `CLAUDE.md`).
 - [ ] Optional one-off: `uv run scan intraday save --days 55` on a local machine to
